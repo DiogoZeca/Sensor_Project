@@ -297,7 +297,7 @@ else                 → POWER_LOSS
 - [x] **Step 3 — INA219** (I2C from scratch): validate sensor responds at 0x40, calibration correct, nominal values (~4.08V, ~0.91mA) match expectations on serial monitor
 - [x] **Step 4 — Integration: INA219 + TFT + Alerts**: real V/I/P on display, alert states driving LED and buzzer — fully functional standalone device
 - [ ] **Step 5 — WiFi + MQTT**: connect to local broker, publish JSON payload, verify data arrives on laptop
-- [ ] **Step 6 — Full FreeRTOS integration**: restructure into 3 tasks (sensor/display/mqtt) with mutex-protected shared struct, final architecture
+- [x] **Step 6 — Full FreeRTOS integration**: restructure into 3 tasks (sensor/display/mqtt) with mutex-protected shared struct, final architecture
 
 ---
 
@@ -332,6 +332,84 @@ After Step 6 is complete, light sleep can be added cleanly — wrap task delays 
 WiFi stays associated via modem sleep during idle. Fault detection latency remains ~1s.
 
 **Reference:** [ESP32-C6 Sleep Modes — ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c6/api-reference/system/sleep_modes.html)
+
+---
+
+## Demo Runbook
+
+### Network (do this first, every session)
+
+1. Turn on phone hotspot (SSID: `.`, password: `timzera123`)
+2. Connect laptop to it
+3. Check laptop IP:
+   ```bash
+   ip route get 1 | awk '{print $7; exit}'
+   ```
+4. If IP changed from last session, update sdkconfig and reflash:
+   ```bash
+   sed -i 's|CONFIG_MQTT_BROKER_URI="[^"]*"|CONFIG_MQTT_BROKER_URI="mqtt://<new-ip>:1884"|' sdkconfig
+   ```
+
+### Server stack
+
+```bash
+cd ~/Documents/ASE/Sensor_Project/server
+docker compose up -d
+```
+
+Wait ~10s for InfluxDB to be ready. Verify with:
+```bash
+mosquitto_sub -h localhost -p 1884 -t "sensors/post/+/metrics" -v
+```
+
+### Flash ESP32
+
+```bash
+cd ~/Documents/ASE/Sensor_Project
+idf.py -p /dev/ttyUSB0 flash monitor
+```
+
+Expected serial output:
+```
+I (wifi): IP: 10.131.87.XXX
+I (mqtt): connected — publishing to sensors/post/18:33:44/metrics
+I (STEP5): V=X.XXXV  I=X.XXXmA  P=X.XXXmW  state=X
+I (mqtt): published msg_id=...: {...}
+```
+
+### Grafana
+
+Open `http://localhost:3000` (admin / admin).
+
+Data source already configured after first setup. If setting up fresh:
+- Connections → Data sources → Add → InfluxDB
+- Query language: Flux
+- URL: `http://influxdb:8086`
+- Org: `ase` | Bucket: `sensors` | Token: `my-super-secret-token`
+
+Dashboard Flux queries:
+
+| Panel | Field |
+|---|---|
+| Voltage | `r._field == "voltage"` |
+| Current | `r._field == "current_ma"` |
+| Power | `r._field == "power_mw"` |
+| Status | `r._field == "status_code"` + `last()` |
+
+```flux
+from(bucket: "sensors")
+  |> range(start: -10m)
+  |> filter(fn: (r) => r._measurement == "power_metrics" and r._field == "voltage")
+```
+
+Set dashboard auto-refresh to **5s**.
+
+### Shutdown
+
+```bash
+cd ~/Documents/ASE/Sensor_Project/server
+docker compose down
+```
 
 ---
 

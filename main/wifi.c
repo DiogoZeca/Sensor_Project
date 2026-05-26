@@ -69,7 +69,6 @@ void wifi_init_sta(void)
         pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (!(bits & WIFI_CONNECTED_BIT)) {
-        ESP_LOGE(TAG, "WiFi failed — check SSID/password in menuconfig");
-        while (1) vTaskDelay(portMAX_DELAY);
+        ESP_LOGE(TAG, "WiFi failed — continuing without network (check SSID/password)");
     }
 }
