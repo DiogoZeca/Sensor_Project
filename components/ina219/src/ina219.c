@@ -27,13 +27,14 @@ static const char *TAG = "INA219";
            SADC=0011 (12-bit), MODE=111 (continuous shunt+bus)      */
 #define CONFIG_VAL   0x019F
 
-/* Cal = trunc(0.04096 / (1e-6 × 10)) = 4096 → Current LSB = 1µA  */
-#define CALIB_VAL    4096
+/* GY-INA219Z module has onboard 0.1Ω shunt (marked R100 on PCB).
+   Cal = trunc(0.04096 / (10e-6 × 0.1)) = 40960 → Current LSB = 10µA */
+#define CALIB_VAL    40960
 
 /* ── LSB scaling ─────────────────────────────────────────────────── */
 #define BUS_VOLTAGE_LSB_V   0.004f    /* 4 mV per LSB                */
-#define CURRENT_LSB_MA      0.001f    /* 1 µA = 0.001 mA per LSB     */
-#define POWER_LSB_MW        0.020f    /* 20 µW = 0.020 mW per LSB    */
+#define CURRENT_LSB_MA      0.010f    /* 10 µA = 0.010 mA per LSB    */
+#define POWER_LSB_MW        0.200f    /* 200 µW = 0.200 mW per LSB   */
 
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
@@ -93,7 +94,7 @@ esp_err_t ina219_init(void)
     /* Wait for the first conversion to complete (~1.1ms for 12-bit) */
     vTaskDelay(pdMS_TO_TICKS(2));
 
-    ESP_LOGI(TAG, "INA219 ready at 0x%02X (config=0x%04X cal=%d)",
+    ESP_LOGI(TAG, "INA219 ready at 0x%02X (config=0x%04X cal=%d, shunt=0.1Ω)",
              INA219_ADDR, CONFIG_VAL, CALIB_VAL);
     return ESP_OK;
 }

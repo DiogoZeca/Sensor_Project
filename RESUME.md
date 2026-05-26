@@ -15,25 +15,29 @@ MQTT, and triggers local alerts (LED + buzzer) based on power state.
 
 | Parameter | Value |
 |---|---|
-| Supply type | Bipolar bench supply |
-| Positive rail | +5V (relative to COM/GND) |
-| Negative rail | -5V (relative to COM/GND) |
-| Total voltage across load | 10V |
-| System GND | Bench supply COM terminal |
+| Supply type | Single-rail bench supply |
+| Output | 0–5V between + and − terminals |
+| GND terminal | Earth/chassis only — NOT used as circuit reference |
+| System GND | Bench supply **−** terminal → ESP32 GND |
 
 ### Load Chain (LOAD section)
 
 | Component | Value | Role |
 |---|---|---|
-| R1 | 10Ω | Shunt resistor — measured by INA219 |
-| R2 | 1KΩ | Load resistor |
-| R3 | 10KΩ | Load resistor |
-| Total resistance | 11,010Ω | — |
+| R1 | 10Ω | Protective series resistor before Vin+ |
+| R2 | 1KΩ | Bottom resistor of voltage divider (Vin- → GND) |
+| R3 | 10KΩ potentiometer | Top of voltage divider (CH+ → Vin+) — controls bus voltage |
 
-**Nominal operating point:**
-- Current ≈ 10V / 11,010Ω ≈ **0.908 mA**
-- Shunt voltage (across R1) ≈ **9.08 mV**
-- Bus voltage at INA219 IN- (V_LOAD) ≈ **+4.08V** relative to GND
+**Circuit path:**
+```
+CH+(+5V) → R1(10Ω) → Vin+(INA219) → [R100 shunt] → Vin-(INA219) → R2(1KΩ) → CH−(GND)
+                                                              ↑
+                                              R3 (pot) is between CH+ and Vin+
+```
+
+**Nominal operating point (pot at mid ~5KΩ):**
+- Current ≈ 5V / 6,010Ω ≈ **0.83 mA**
+- Bus voltage at Vin- ≈ **5 × 1KΩ / (5KΩ + 1KΩ) ≈ 0.83V** (NORMAL range)
 
 ### INA219 — GY-INA219Z (SENSING section)
 
@@ -52,11 +56,11 @@ MQTT, and triggers local alerts (LED + buzzer) based on power state.
 | Register | Address | Value | Notes |
 |---|---|---|---|
 | Configuration | 0x00 | 0x019F | See breakdown below |
-| Calibration | 0x05 | 4096 | 1µA current LSB |
+| Calibration | 0x05 | 40960 | 10µA current LSB |
 | Shunt Voltage | 0x01 | read-only | LSB = 10µV |
 | Bus Voltage | 0x02 | read-only | LSB = 4mV |
-| Current | 0x04 | read-only | LSB = 1µA |
-| Power | 0x03 | read-only | LSB = 20µW |
+| Current | 0x04 | read-only | LSB = 10µA |
+| Power | 0x03 | read-only | LSB = 200µW |
 
 **Configuration register 0x019F breakdown:**
 
@@ -72,8 +76,16 @@ MQTT, and triggers local alerts (LED + buzzer) based on power state.
 **Calibration formula:**
 ```
 Cal = trunc(0.04096 / (Current_LSB × R_shunt))
-Cal = trunc(0.04096 / (0.000001 × 10)) = 4096
-Current_LSB = 1µA → Power_LSB = 20µW
+```
+
+> **Hardware note:** GY-INA219Z has an onboard 0.1Ω shunt (marked "R100" on PCB).
+> R1 (10Ω) stays in circuit as a series resistor before Vin+ (protection), not as the sense shunt.
+
+```
+R_shunt = 0.1Ω (module onboard)
+Current_LSB = 10µA  (1µA needs Cal=409600 → overflows 16-bit register)
+Cal = trunc(0.04096 / (0.000010 × 0.1)) = 40960
+Power_LSB = 20 × 10µA = 200µW
 ```
 
 ### ESP32-C6 DevKitC-1 (ESP-32 section)
@@ -119,9 +131,9 @@ Current_LSB = 1µA → Power_LSB = 20µW
 
 | State | Condition | LED | Buzzer |
 |---|---|---|---|
-| NORMAL | Bus voltage > 3.5V | Steady ON | Silent |
-| BROWNOUT | 0.3V < bus voltage ≤ 3.5V | Slow blink (500ms period) | Intermittent tone ~1kHz |
-| POWER LOSS | Bus voltage ≤ 0.3V | Fast blink (100ms period) | Intermittent tone ~3kHz |
+| NORMAL | 1.0V ≤ bus voltage ≤ 3.9V | Steady ON | Silent |
+| BROWNOUT | Bus voltage > 3.9V (overload) | Slow blink (500ms period) | Intermittent tone ~1kHz |
+| POWER LOSS | Bus voltage < 1.0V | Fast blink (100ms period) | Intermittent tone ~3kHz |
 
 ---
 
@@ -260,7 +272,7 @@ Grafana dashboards can filter by `post_id` tag to show per-post state.
 
 ### Initialization sequence
 1. Write config register (0x019F)
-2. Write calibration register (4096)
+2. Write calibration register (40960)
 3. Wait one conversion cycle (~2ms)
 
 ### Read sequence (per cycle)
@@ -271,8 +283,8 @@ Grafana dashboards can filter by `post_id` tag to show per-post state.
 
 ### Threshold evaluation
 ```
-if   voltage > 3.5V  → NORMAL
-elif voltage > 0.3V  → BROWNOUT
+if   voltage > 3.9V  → BROWNOUT  (overload)
+elif voltage >= 1.0V → NORMAL
 else                 → POWER_LOSS
 ```
 
@@ -282,8 +294,8 @@ else                 → POWER_LOSS
 
 - [x] **Step 1 — LED + Buzzer** (GPIO + LEDC PWM): verify GP4/GP5 wiring, control LED and buzzer independently
 - [x] **Step 2 — TFT Display** (SPI): port st7735_driver from aula10 with correct pin mapping, get something visible on screen
-- [ ] **Step 3 — INA219** (I2C from scratch): validate sensor responds at 0x40, calibration correct, nominal values (~4.08V, ~0.91mA) match expectations on serial monitor
-- [ ] **Step 4 — Integration: INA219 + TFT + Alerts**: real V/I/P on display, alert states driving LED and buzzer — fully functional standalone device
+- [x] **Step 3 — INA219** (I2C from scratch): validate sensor responds at 0x40, calibration correct, nominal values (~4.08V, ~0.91mA) match expectations on serial monitor
+- [x] **Step 4 — Integration: INA219 + TFT + Alerts**: real V/I/P on display, alert states driving LED and buzzer — fully functional standalone device
 - [ ] **Step 5 — WiFi + MQTT**: connect to local broker, publish JSON payload, verify data arrives on laptop
 - [ ] **Step 6 — Full FreeRTOS integration**: restructure into 3 tasks (sensor/display/mqtt) with mutex-protected shared struct, final architecture
 
