@@ -42,6 +42,7 @@ static alert_state_t evaluate_state(float v)
 static void task_sensor(void *arg)
 {
     alert_state_t prev_state = ALERT_NORMAL;
+    int cycle = 0;
 
     while (1) {
         float v = 0.0f, i = 0.0f, p = 0.0f;
@@ -64,10 +65,24 @@ static void task_sensor(void *arg)
             xSemaphoreGive(g_mutex);
         }
 
-        /* notify MQTT task only when state changes */
-        if (state != prev_state) {
+        ++cycle;
+
+        /* state change → lp_mode=0 (AWAKE: system reacting to event) */
+        bool state_changed = (state != prev_state);
+        if (state_changed) {
             prev_state = state;
-            xTaskNotifyGive(g_mqtt_task_handle);
+            xTaskNotify(g_mqtt_task_handle, 0, eSetValueWithOverwrite);
+        }
+
+        if (cycle % 10 == 0) {
+            /* print PM sleep stats every 10s for demo */
+            ESP_LOGI(TAG, "--- PM lock stats ---");
+            esp_pm_dump_locks(stdout);
+
+            /* heartbeat → lp_mode=1 (SLEEPING) only if no state change this cycle */
+            if (!state_changed) {
+                xTaskNotify(g_mqtt_task_handle, 1, eSetValueWithOverwrite);
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -98,7 +113,8 @@ static void task_display(void *arg)
 static void task_mqtt(void *arg)
 {
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint32_t lp_active = 1;
+        xTaskNotifyWait(0, ULONG_MAX, &lp_active, portMAX_DELAY);
 
         float v = 0.0f, i = 0.0f, p = 0.0f;
         alert_state_t state = ALERT_POWER_LOSS;
@@ -111,7 +127,7 @@ static void task_mqtt(void *arg)
             xSemaphoreGive(g_mutex);
         }
 
-        mqtt_publish(v, i, p, state);
+        mqtt_publish(v, i, p, state, (int)lp_active);
     }
 }
 

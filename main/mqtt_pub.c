@@ -55,20 +55,21 @@ static const char *status_str(alert_state_t s)
     }
 }
 
-void mqtt_publish(float voltage_v, float current_ma, float power_mw, alert_state_t status)
+void mqtt_publish(float voltage_v, float current_ma, float power_mw, alert_state_t status, int lp_active)
 {
     if (!s_client) return;
 
-    char payload[128];
+    char payload[160];
     snprintf(payload, sizeof(payload),
         "{\"post_id\":\"%s\","
         "\"voltage\":%.3f,"
         "\"current_ma\":%.3f,"
         "\"power_mw\":%.3f,"
         "\"status\":\"%s\","
-        "\"status_code\":%d}",
+        "\"status_code\":%d,"
+        "\"lp_mode\":%d}",
         s_post_id, voltage_v, current_ma, power_mw,
-        status_str(status), (int)status);
+        status_str(status), (int)status, lp_active);
 
     int msg_id = esp_mqtt_client_publish(s_client, s_topic, payload, 0, 1, 0);
     if (msg_id < 0) {
