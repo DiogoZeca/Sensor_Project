@@ -79,9 +79,10 @@ static void task_sensor(void *arg)
             ESP_LOGI(TAG, "--- PM lock stats ---");
             esp_pm_dump_locks(stdout);
 
-            /* heartbeat → lp_mode=1 (SLEEPING) only if no state change this cycle */
+            /* heartbeat → lp_mode=1 (SLEEPING) only when NORMAL and no state change */
             if (!state_changed) {
-                xTaskNotify(g_mqtt_task_handle, 1, eSetValueWithOverwrite);
+                int lp = (state == ALERT_NORMAL) ? 1 : 0;
+                xTaskNotify(g_mqtt_task_handle, lp, eSetValueWithOverwrite);
             }
         }
 
