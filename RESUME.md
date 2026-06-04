@@ -101,7 +101,6 @@ Power_LSB = 20 × 10µA = 200µW
 | TFT Reset | GP21 |
 | TFT Data/Command | GP20 |
 | TFT Backlight | GP18 |
-| SD Card CS | GP19 (reserved, not used) |
 | Status LED | GP4 (with R6 = 330Ω to GND) |
 | Buzzer | GP5 |
 | Supply | 3V3 onboard regulator |
@@ -112,18 +111,17 @@ Power_LSB = 20 × 10µA = 200µW
 |---|---|
 | Model | Adafruit 0.96" TFT |
 | Controller | ST7735R |
-| Resolution | 160×80 pixels (landscape) |
+| Resolution | 160×80 pixels |
 | Interface | SPI |
 | Pull-ups on bus | R7, R8, R9 = 10KΩ |
 | Backlight | Controlled via GP18 |
-| SD slot | Present, CS on GP19 (not used in this project) |
 
 ### Alert Components
 
-| Component | GPIO | Series resistor | Behavior |
+| Component | GPIO |
 |---|---|---|---|
-| Status LED (D1) | GP4 | R6 = 330Ω | See alert states below |
-| Buzzer (BZ) | GP5 | — | See alert states below |
+| Status LED (D1) | GP4 | 
+| Buzzer (BZ) | GP5 |
 
 ---
 
@@ -255,20 +253,7 @@ Grafana dashboards can filter by `post_id` tag to show per-post state.
 
 ---
 
-## Lab Guide References
-
-| Feature | Reference |
-|---|---|
-| FreeRTOS tasks, mutex, notifications | aula02 |
-| GPIO (LED, buzzer) | aula03 |
-| I2C master driver (INA219 pattern) | aula04 |
-| SPI / TFT driver | aula10 |
-| WiFi STA mode | aula08 |
-| MQTT TCP | aula09 |
-
----
-
-## INA219 Driver Design (from scratch)
+## INA219 Driver Design 
 
 ### Initialization sequence
 1. Write config register (0x019F)
@@ -290,134 +275,79 @@ else                 → POWER_LOSS
 
 ---
 
-## Implementation Steps
-
-- [x] **Step 1 — LED + Buzzer** (GPIO + LEDC PWM): verify GP4/GP5 wiring, control LED and buzzer independently
-- [x] **Step 2 — TFT Display** (SPI): port st7735_driver from aula10 with correct pin mapping, get something visible on screen
-- [x] **Step 3 — INA219** (I2C from scratch): validate sensor responds at 0x40, calibration correct, nominal values (~4.08V, ~0.91mA) match expectations on serial monitor
-- [x] **Step 4 — Integration: INA219 + TFT + Alerts**: real V/I/P on display, alert states driving LED and buzzer — fully functional standalone device
-- [ ] **Step 5 — WiFi + MQTT**: connect to local broker, publish JSON payload, verify data arrives on laptop
-- [x] **Step 6 — Full FreeRTOS integration**: restructure into 3 tasks (sensor/display/mqtt) with mutex-protected shared struct, final architecture
-
----
-
 ## Power Mode Strategy
 
-### Decision: Always Active (for now)
+### Decision: Light Sleep via FreeRTOS Tickless Idle
 
-Deep sleep is **ruled out** for this application — fault detection requires immediate response.
+Deep sleep is **ruled out** — fault detection requires immediate response.
 If the post loses power at second 1 of a 30-second sleep cycle, the outage is only detected
 29 seconds later, which is unacceptable for infrastructure monitoring.
 
+Light sleep via FreeRTOS tickless idle is the implemented solution: the CPU sleeps
+automatically whenever all tasks are blocked in `vTaskDelay()`. No task code changes needed.
+WiFi stays associated via modem sleep between beacon intervals.
+
 ### Options analyzed
 
-| Mode | Latency | Avg Current | Verdict |
-|---|---|---|---|
-| Always Active | <1s | ~80–100mA | ✅ Current choice — simple, zero latency, display always live |
-| Light Sleep (RTC timer) | ~1s | ~5–20mA | ✅ Compatible — viable future optimization (aula07 has patterns) |
-| GPIO wake via INA219 ALERT pin | <1ms | <1mA | ❌ Not wired in our circuit — ALERT pin not connected to any GPIO |
-| Deep Sleep | Up to 30s+ | <0.1mA | ❌ Ruled out — unacceptable fault detection latency |
+| Mode | Latency | Verdict |
+|---|---|---|
+| Always Active | <1s | ✅ Works but wastes energy |
+| **Light Sleep (tickless idle)** | **<1s** | ✅ **Implemented — best of both worlds** |
+| GPIO wake via INA219 ALERT pin | <1ms | ❌ Not wired in our circuit |
+| Deep Sleep | Up to 30s+ | ❌ Ruled out — unacceptable fault detection latency |
 
-### Key design choice regardless of sleep mode
+### Implementation
+
+Enabled via sdkconfig flags:
+
+```
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_PROFILING=y
+```
+
+Configured in `app_main()`:
+
+```c
+esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   /* WiFi modem sleep between beacons */
+
+esp_pm_config_t pm_config = {
+    .max_freq_mhz       = 160,
+    .min_freq_mhz       = 40,
+    .light_sleep_enable = true,
+};
+esp_pm_configure(&pm_config);
+```
+
+### Measured Result
+
+PM lock stats printed every 10s via `esp_pm_dump_locks(stdout)`:
+
+```
+Mode      CPU_freq    Time(us)      Time(%)
+SLEEP     40 M        886721997     50%
+APB_MIN   40 M        2994418        0%
+APB_MAX   80 M        172759599      9%
+CPU_MAX   160M        690826544     39%
+```
+
+| Mode | Meaning |
+|---|---|
+| SLEEP | CPU in light sleep — all tasks blocked |
+| APB_MIN | Transitional — CPU active, no peripherals needed |
+| APB_MAX | WiFi active (80MHz APB required) — MQTT publishes |
+| CPU_MAX | Heavy work — INA219 read, SPI display, FreeRTOS scheduler |
+
+**~50% of runtime sleeping, zero missed fault events.**
+
+### Key design choice
 
 MQTT publish is **state-change-triggered**, not time-triggered. The ESP32 only publishes
-when the status transitions between NORMAL / BROWNOUT / POWER LOSS. This avoids flooding
-the broker with redundant "still NORMAL" messages every second and is a real-world pattern
-used in production monitoring systems.
+when the status transitions between NORMAL / BROWNOUT / POWER LOSS, plus a 10s heartbeat
+when in NORMAL state. This avoids flooding the broker and is a real-world pattern used in
+production monitoring systems.
 
-### Future: Light Sleep (optional Step 7)
+The `lp_mode` field in the MQTT payload signals whether the publish was triggered by an
+active event (`lp_mode=0`, AWAKE) or an idle heartbeat (`lp_mode=1`, SLEEPING), making
+power management state visible on the Grafana dashboard.
 
-After Step 6 is complete, light sleep can be added cleanly — wrap task delays with
-`esp_light_sleep_start()` instead of `vTaskDelay()`. No restructuring needed.
-WiFi stays associated via modem sleep during idle. Fault detection latency remains ~1s.
-
-**Reference:** [ESP32-C6 Sleep Modes — ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c6/api-reference/system/sleep_modes.html)
-
----
-
-## Demo Runbook
-
-### Network (do this first, every session)
-
-1. Turn on phone hotspot (SSID: `.`, password: `timzera123`)
-2. Connect laptop to it
-3. Check laptop IP:
-   ```bash
-   ip route get 1 | awk '{print $7; exit}'
-   ```
-4. If IP changed from last session, update sdkconfig and reflash:
-   ```bash
-   sed -i 's|CONFIG_MQTT_BROKER_URI="[^"]*"|CONFIG_MQTT_BROKER_URI="mqtt://<new-ip>:1884"|' sdkconfig
-   ```
-
-### Server stack
-
-```bash
-cd ~/Documents/ASE/Sensor_Project/server
-docker compose up -d
-```
-
-Wait ~10s for InfluxDB to be ready. Verify with:
-```bash
-mosquitto_sub -h localhost -p 1884 -t "sensors/post/+/metrics" -v
-```
-
-### Flash ESP32
-
-```bash
-cd ~/Documents/ASE/Sensor_Project
-idf.py -p /dev/ttyUSB0 flash monitor
-```
-
-Expected serial output:
-```
-I (wifi): IP: 10.131.87.XXX
-I (mqtt): connected — publishing to sensors/post/18:33:44/metrics
-I (STEP5): V=X.XXXV  I=X.XXXmA  P=X.XXXmW  state=X
-I (mqtt): published msg_id=...: {...}
-```
-
-### Grafana
-
-Open `http://localhost:3000` (admin / admin).
-
-Data source already configured after first setup. If setting up fresh:
-- Connections → Data sources → Add → InfluxDB
-- Query language: Flux
-- URL: `http://influxdb:8086`
-- Org: `ase` | Bucket: `sensors` | Token: `my-super-secret-token`
-
-Dashboard Flux queries:
-
-| Panel | Field |
-|---|---|
-| Voltage | `r._field == "voltage"` |
-| Current | `r._field == "current_ma"` |
-| Power | `r._field == "power_mw"` |
-| Status | `r._field == "status_code"` + `last()` |
-
-```flux
-from(bucket: "sensors")
-  |> range(start: -10m)
-  |> filter(fn: (r) => r._measurement == "power_metrics" and r._field == "voltage")
-```
-
-Set dashboard auto-refresh to **5s**.
-
-### Shutdown
-
-```bash
-cd ~/Documents/ASE/Sensor_Project/server
-docker compose down
-```
-
----
-
-## Open Decisions / Future Updates
-
-- [x] Buzzer: driven in **passive mode via LEDC PWM**. Chosen over active mode for
-      expressiveness — different frequencies per alert state (BROWNOUT ~1kHz, POWER LOSS
-      ~3kHz) make alerts distinguishable by ear. On/off beep patterns controlled fully
-      in software. GP5 wiring unchanged.
-- [ ] SD card offline buffering — decided OUT OF SCOPE for this version
-- [ ] OTA update support — not in scope
